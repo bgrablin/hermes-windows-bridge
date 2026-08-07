@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a reproducible problem in the bridge, client, or release tooling
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include tokens, private keys, certificates, private hostnames, network addresses, private paths, prompts, or raw operational logs. Report suspected vulnerabilities through a private security advisory instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Provide the release tag or commit SHA.
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide the Windows version, controller operating system, Python version, and relevant Hermes version.
+      placeholder: Windows 11; Ubuntu 24.04 controller; Python 3.11
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest sequence that demonstrates the problem.
+      placeholder: |
+        1. Configure...
+        2. Run...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Sanitize all output before pasting it here.
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Include only sanitized details that help reproduce or diagnose the problem.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: This report does not disclose a security vulnerability.
+          required: true
+        - label: I removed credentials and private operational data.
+          required: true
+        - label: I will follow the [Code of Conduct](https://github.com/bgrablin/hermes-windows-bridge/blob/main/CODE_OF_CONDUCT.md).
+          required: true

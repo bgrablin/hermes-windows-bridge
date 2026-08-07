@@ -147,6 +147,12 @@ tests/                          runtime, client, release, and privacy checks
 docs/                           operator and security documentation
 ```
 
+## Contributing and support
+
+Bug reports, documentation fixes, tests, and focused code improvements are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Use the structured issue forms for bugs, feature requests, and usage questions.
+
+See [SUPPORT.md](SUPPORT.md) for support scope, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+
 ## Release
 
 Version 1.0.0 is the current source distribution. Release packages are generated locally because their certificate and listener identity belong to the operator.

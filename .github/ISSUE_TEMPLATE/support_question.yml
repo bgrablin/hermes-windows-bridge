@@ -1,0 +1,48 @@
+name: Help or usage question
+description: Ask for help with documented installation, configuration, or operation
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read the README, operations guide, security model, and SUPPORT.md first. Do not include credentials or private operational data. Use a private security advisory for suspected vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Provide the release tag or commit SHA.
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What are you trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: List the documentation and sanitized commands or checks you used.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide only non-sensitive operating system and software versions.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I read the project documentation and searched existing issues.
+          required: true
+        - label: I removed credentials and private operational data.
+          required: true
+        - label: I will follow the [Code of Conduct](https://github.com/bgrablin/hermes-windows-bridge/blob/main/CODE_OF_CONDUCT.md).
+          required: true

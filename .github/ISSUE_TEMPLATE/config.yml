@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/bgrablin/hermes-windows-bridge/security/advisories/new
+    about: Report vulnerabilities privately. Do not disclose security details in an issue.
+  - name: Read the support policy
+    url: https://github.com/bgrablin/hermes-windows-bridge/blob/main/SUPPORT.md
+    about: Review support scope and information-handling requirements before opening an issue.
