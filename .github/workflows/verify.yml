@@ -1,0 +1,68 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    name: portable / Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install verification tools
+        run: python -m pip install --disable-pip-version-check pytest ruff
+      - name: Compile source
+        run: python -m compileall -q hermes_windows_bridge.py bridge_child_bootstrap.py tools scripts tests
+      - name: Lint
+        run: python -m ruff check .
+      - name: Verify public surface
+        run: python scripts/public_surface_check.py
+      - name: Run test suite
+        run: python -m pytest -q
+
+  windows:
+    name: Windows runtime / Python 3.11
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install verification tools
+        run: python -m pip install --disable-pip-version-check pytest ruff
+      - name: Confirm certificate tool
+        shell: pwsh
+        run: |
+          (Get-Command openssl -ErrorAction Stop).Source
+          openssl version
+      - name: Compile source
+        run: python -m compileall -q hermes_windows_bridge.py bridge_child_bootstrap.py tools scripts tests
+      - name: Lint
+        run: python -m ruff check .
+      - name: Verify public surface
+        run: python scripts/public_surface_check.py
+      - name: Run Windows test suite
+        run: python -m pytest -q

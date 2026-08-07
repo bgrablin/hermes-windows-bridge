@@ -1,0 +1,29 @@
+{
+  "payloads": [
+    {
+      "path": "release-layout.json",
+      "role": "release-layout"
+    },
+    {
+      "path": "hermes_windows_bridge.py",
+      "role": "bridge-server"
+    },
+    {
+      "path": "bridge_child_bootstrap.py",
+      "role": "child-bootstrap"
+    },
+    {
+      "path": "bridge-private-state.ps1",
+      "role": "private-state-attestor"
+    },
+    {
+      "path": "certs/bridge-cert.pem",
+      "role": "public-certificate"
+    },
+    {
+      "path": "client/hermes-windows-bridge",
+      "role": "controller-client"
+    }
+  ],
+  "schema_version": 1
+}

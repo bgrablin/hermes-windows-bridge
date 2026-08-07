@@ -1,0 +1,23 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Local release inputs and outputs
+local/
+dist/
+*.key
+*.pfx
+*.p12
+*.pem
+bridge-token
+.env
+.env.*
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+import argparse
+import functools
+import hmac
+import http.client
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import ssl
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_ROOT = pathlib.Path(os.environ.get(
+    'HERMES_WINDOWS_BRIDGE_CONFIG_DIR',
+    pathlib.Path.home() / '.config' / 'hermes-windows-bridge'))
+DEFAULT_URL = os.environ.get(
+    'HERMES_WINDOWS_BRIDGE_URL', 'https://127.0.0.1:8765')
+TOKEN_FILE = pathlib.Path(os.environ.get(
+    'HERMES_WINDOWS_BRIDGE_TOKEN_FILE', CONFIG_ROOT / 'bridge-token'))
+CA_FILE = pathlib.Path(os.environ.get(
+    'HERMES_WINDOWS_BRIDGE_CA_FILE', CONFIG_ROOT / 'bridge-cert.pem'))
+
+EXECUTION_ROUTES = frozenset({
+    '/run/terminal',
+    '/run/hermes',
+    '/jobs/terminal',
+    '/jobs/hermes',
+})
+RETRYABLE_EXECUTION_STATUSES = {
+    'capacity_exhausted': 429,
+    'resource_pressure': 503,
+    'quiesced': 503,
+    'job_state_unavailable': 503,
+}
+ERROR_CODE_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
+CERTIFICATE_BEGIN = '-----BEGIN CERTIFICATE-----'
+CERTIFICATE_END = '-----END CERTIFICATE-----'
+
+
+class BridgeRequestError(RuntimeError):
+    pass
+
+
+def _require_posix_private_file(path, secret):
+    path = pathlib.Path(path)
+    if os.name != 'nt':
+        metadata = path.stat()
+        forbidden = 0o077 if secret else 0o022
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & forbidden):
+            raise BridgeRequestError('bridge trust material has unsafe permissions')
+    return path
+
+
+def build_tls_context(ca_file=CA_FILE):
+    try:
+        path = _require_posix_private_file(ca_file, secret=False)
+        return ssl.create_default_context(cafile=str(path))
+    except BridgeRequestError:
+        raise
+    except (OSError, ssl.SSLError, ValueError):
+        raise BridgeRequestError('bridge certificate is unavailable') from None
+
+
+def _load_certificate_der(cert_file=CA_FILE):
+    try:
+        path = _require_posix_private_file(cert_file, secret=False)
+        pem = path.read_text(encoding='utf-8')
+    except BridgeRequestError:
+        raise
+    except (OSError, UnicodeError):
+        raise BridgeRequestError('bridge certificate pin is unavailable') from None
+    if pem.count(CERTIFICATE_BEGIN) != 1 or pem.count(CERTIFICATE_END) != 1:
+        raise BridgeRequestError('bridge certificate pin is invalid')
+    start = pem.find(CERTIFICATE_BEGIN)
+    end = pem.find(CERTIFICATE_END, start) + len(CERTIFICATE_END)
+    try:
+        der = ssl.PEM_cert_to_DER_cert(pem[start:end])
+    except ValueError:
+        raise BridgeRequestError('bridge certificate pin is invalid') from None
+    if not der:
+        raise BridgeRequestError('bridge certificate pin is invalid')
+    return der
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, expected_peer_der, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._expected_peer_der = bytes(expected_peer_der)
+
+    def connect(self):
+        # The standard connection performs CA-chain and hostname validation first.
+        super().connect()
+        try:
+            peer_der = self.sock.getpeercert(binary_form=True) if self.sock else None
+        except (OSError, ssl.SSLError):
+            peer_der = None
+        if (not isinstance(peer_der, bytes)
+                or not hmac.compare_digest(peer_der, self._expected_peer_der)):
+            self.close()
+            raise ssl.SSLCertVerificationError('bridge peer certificate pin mismatch')
+
+
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _request, _fp, _code, _message, _headers, _new_url):
+        raise BridgeRequestError('bridge redirect rejected')
+
+
+class _RejectHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, _request):
+        raise BridgeRequestError('plaintext HTTP rejected')
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, context, expected_peer_der):
+        super().__init__(context=context)
+        self._expected_peer_der = bytes(expected_peer_der)
+
+    def https_open(self, request):
+        connection = functools.partial(
+            _PinnedHTTPSConnection,
+            expected_peer_der=self._expected_peer_der,
+        )
+        return self.do_open(
+            connection,
+            request,
+            context=self._context,
+        )
+
+
+def _build_pinned_opener(context, expected_peer_der):
+    return urllib.request.build_opener(
+        # Supplying an explicit empty handler prevents build_opener from
+        # inheriting HTTP(S)_PROXY or platform proxy configuration.
+        urllib.request.ProxyHandler({}),
+        _RejectHTTPHandler(),
+        _RejectRedirectHandler(),
+        _PinnedHTTPSHandler(context, expected_peer_der),
+    )
+
+
+def load_token(token_file=TOKEN_FILE):
+    try:
+        path = _require_posix_private_file(token_file, secret=True)
+        token = path.read_text(encoding='utf-8').strip()
+    except BridgeRequestError:
+        raise
+    except (OSError, UnicodeError):
+        raise BridgeRequestError('bridge credential is unavailable') from None
+    if not token:
+        raise BridgeRequestError('bridge credential is unavailable')
+    return token
+
+
+def _retry_delay(headers):
+    try:
+        value = float(headers.get('Retry-After', '5') if headers else '5')
+    except (TypeError, ValueError):
+        value = 5.0
+    return min(30.0, max(0.0, value))
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON key')
+        result[key] = value
+    return result
+
+
+def _error_payload(response):
+    try:
+        raw = response.read(65537)
+        if len(raw) > 65536:
+            return None
+        payload = json.loads(
+            raw.decode('utf-8'), object_pairs_hook=_unique_json_object
+        )
+    except (AttributeError, TypeError, ValueError, UnicodeDecodeError,
+            OSError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _error_code(payload):
+    value = payload.get('error_code') if isinstance(payload, dict) else None
+    if isinstance(value, str) and ERROR_CODE_PATTERN.fullmatch(value):
+        return value
+    return 'http_error'
+
+
+def _can_retry_execution(method, path, status, payload):
+    if method != 'POST' or path not in EXECUTION_ROUTES or not isinstance(payload, dict):
+        return False
+    error_code = payload.get('error_code')
+    return (isinstance(error_code, str)
+            and payload.get('execution_started') is False
+            and RETRYABLE_EXECUTION_STATUSES.get(error_code) == status)
+
+
+def _is_unspecified_address(address):
+    if bool(getattr(address, 'is_unspecified', False)):
+        return True
+    mapped = getattr(address, 'ipv4_mapped', None)
+    return mapped is not None and bool(mapped.is_unspecified)
+
+
+def _canonical_base_url_host(hostname):
+    if not hostname or '%' in hostname:
+        raise BridgeRequestError('invalid bridge URL')
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.split('.')
+        if (not hostname.isascii() or len(hostname) > 253
+                or all(character.isdigit() or character == '.'
+                       for character in hostname)
+                or any(not re.fullmatch(
+                    r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label
+                ) for label in labels)):
+            raise BridgeRequestError('invalid bridge URL') from None
+        return hostname
+    if _is_unspecified_address(address):
+        raise BridgeRequestError('invalid bridge URL')
+    if address.version == 6:
+        return f'[{address.compressed}]'
+    return address.compressed
+
+
+def _normalize_base_url(base_url):
+    if (not isinstance(base_url, str) or not base_url
+            or any(character == '\\' or character.isspace()
+                   or ord(character) < 0x20 or ord(character) == 0x7f
+                   for character in base_url)):
+        raise BridgeRequestError('invalid bridge URL')
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise BridgeRequestError('invalid bridge URL') from None
+    if (parsed.scheme.lower() != 'https' or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path or parsed.query or parsed.fragment
+            or any(character.isspace() for character in parsed.netloc)
+            or (port is not None and not 1 <= port <= 65535)):
+        raise BridgeRequestError('invalid bridge URL')
+    host = _canonical_base_url_host(parsed.hostname)
+    authority = host if port is None else f'{host}:{port}'
+    canonical = f'https://{authority}'
+    if base_url != canonical:
+        raise BridgeRequestError('invalid bridge URL')
+    return canonical
+
+
+def _require_verified_tls_context(context):
+    if (not isinstance(context, ssl.SSLContext)
+            or context.verify_mode != ssl.CERT_REQUIRED
+            or context.check_hostname is not True):
+        raise BridgeRequestError(
+            'bridge TLS context must verify CA and hostname'
+        )
+
+
+def _decode_response(response):
+    try:
+        return json.loads(response.read().decode('utf-8'))
+    except (AttributeError, TypeError, UnicodeDecodeError, json.JSONDecodeError, OSError):
+        raise BridgeRequestError('bridge returned an invalid response') from None
+
+
+def req(method, path, body=None, timeout=60, *, max_attempts=4,
+        token_file=TOKEN_FILE, cert_file=CA_FILE, base_url=DEFAULT_URL,
+        tls_context=None, opener=None, sleeper=time.sleep):
+    method = str(method).upper()
+    if not isinstance(path, str) or not path.startswith('/') or path.startswith('//'):
+        raise BridgeRequestError('invalid bridge route')
+    origin = _normalize_base_url(base_url)
+    context = tls_context or build_tls_context(cert_file)
+
+    if opener is None:
+        _require_verified_tls_context(context)
+        expected_peer_der = _load_certificate_der(cert_file)
+        open_request = _build_pinned_opener(context, expected_peer_der).open
+        open_kwargs = {'timeout': timeout}
+    else:
+        # An injected opener is a deterministic test seam. CLI traffic always uses
+        # the pinned transport above.
+        open_request = opener
+        open_kwargs = {'timeout': timeout, 'context': context}
+
+    token = None if path == '/health' else load_token(token_file)
+    data = None if body is None else json.dumps(body).encode('utf-8')
+    request = urllib.request.Request(origin + path, data=data, method=method)
+    request.add_header('Content-Type', 'application/json')
+    if token is not None:
+        request.add_header('Authorization', 'Bearer ' + token)
+
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        try:
+            with open_request(request, **open_kwargs) as response:
+                return _decode_response(response)
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            payload = _error_payload(exc)
+            error_code = _error_code(payload)
+            if (_can_retry_execution(method, path, status, payload)
+                    and attempt + 1 < attempts):
+                sleeper(_retry_delay(exc.headers))
+                continue
+            raise BridgeRequestError(
+                f'bridge request failed ({status}, {error_code})'
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError):
+            raise BridgeRequestError('bridge connection failed') from None
+    raise BridgeRequestError('bridge request failed')
+
+
+def emit(result):
+    if isinstance(result, dict) and isinstance(result.get('result'), dict):
+        result = result['result']
+    if isinstance(result, dict):
+        stdout = (result.get('stdout') or '').strip()
+        stderr = (result.get('stderr') or '').strip()
+        if stdout:
+            print(stdout)
+        if stderr:
+            print(stderr, file=sys.stderr)
+        if not stdout and not stderr:
+            print(json.dumps(result, indent=2))
+        return 0 if result.get('ok', False) else int(result.get('exit_code') or 1)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description='Pinned-TLS controller client for Hermes Windows Bridge'
+    )
+    parser.add_argument('--url', default=DEFAULT_URL)
+    parser.add_argument('--token-file', type=pathlib.Path, default=TOKEN_FILE)
+    parser.add_argument(
+        '--cert-file', '--ca-file', dest='cert_file',
+        type=pathlib.Path, default=CA_FILE,
+    )
+    commands = parser.add_subparsers(dest='cmd', required=True)
+    commands.add_parser('health')
+
+    ps = commands.add_parser('ps')
+    ps.add_argument('--timeout', type=int, default=60)
+    ps.add_argument('command', nargs=argparse.REMAINDER)
+
+    hermes = commands.add_parser('hermes')
+    hermes.add_argument(
+        '--toolsets', default='computer_use,terminal,file,browser'
+    )
+    hermes.add_argument('--timeout', type=int, default=300)
+    hermes.add_argument('prompt', nargs=argparse.REMAINDER)
+
+    job = commands.add_parser('job')
+    job.add_argument('kind', choices=['terminal', 'hermes'])
+    job.add_argument(
+        '--toolsets', default='computer_use,terminal,file,browser'
+    )
+    job.add_argument('--timeout', type=int, default=300)
+    job.add_argument('payload', nargs=argparse.REMAINDER)
+
+    get = commands.add_parser('get')
+    get.add_argument('job_id')
+    cancel = commands.add_parser('cancel')
+    cancel.add_argument('job_id')
+
+    args = parser.parse_args(argv)
+    request_options = {
+        'base_url': args.url,
+        'token_file': args.token_file,
+        'cert_file': args.cert_file,
+    }
+    if args.cmd == 'health':
+        print(json.dumps(
+            req('GET', '/health', timeout=10, **request_options), indent=2
+        ))
+        return 0
+    if args.cmd == 'ps':
+        return emit(req(
+            'POST', '/run/terminal',
+            {'command': ' '.join(args.command), 'timeout': args.timeout},
+            timeout=args.timeout + 5,
+            **request_options,
+        ))
+    if args.cmd == 'hermes':
+        return emit(req(
+            'POST', '/run/hermes',
+            {
+                'prompt': ' '.join(args.prompt),
+                'toolsets': args.toolsets,
+                'timeout': args.timeout,
+            },
+            timeout=args.timeout + 5,
+            **request_options,
+        ))
+    if args.cmd == 'job':
+        if args.kind == 'terminal':
+            body = {
+                'command': ' '.join(args.payload),
+                'timeout': args.timeout,
+            }
+            route = '/jobs/terminal'
+        else:
+            body = {
+                'prompt': ' '.join(args.payload),
+                'toolsets': args.toolsets,
+                'timeout': args.timeout,
+            }
+            route = '/jobs/hermes'
+        print(json.dumps(
+            req('POST', route, body, timeout=10, **request_options), indent=2
+        ))
+        return 0
+    if args.cmd == 'cancel':
+        return emit(req(
+            'POST', '/jobs/' + args.job_id + '/cancel',
+            timeout=10,
+            **request_options,
+        ))
+    return emit(req(
+        'GET', '/jobs/' + args.job_id,
+        timeout=10,
+        **request_options,
+    ))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
